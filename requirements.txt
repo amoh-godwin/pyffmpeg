@@ -1,0 +1,5 @@
+pyffmpeg
+requests
+setuptools
+wheel
+twine

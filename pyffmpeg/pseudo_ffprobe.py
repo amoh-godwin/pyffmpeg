@@ -8,10 +8,15 @@ from time import sleep
 import re
 import random
 import os
-from base64 import b64decode
+import logging
+from collections import defaultdict
+# from base64 import b64decode
 
-from .misc import Paths, fix_splashes, SHELL
+from .misc import Paths, SHELL, ModifiedList
 from .extract_functions import VIDEO_FUNC_LIST, AUDIO_FUNC_LIST
+
+
+logger = logging.getLogger('pyffmpeg.pseudo_ffprobe')
 
 
 class FFprobe():
@@ -22,8 +27,11 @@ class FFprobe():
 
     def __init__(self, file_name=None):
 
+        self.logger = logging.getLogger('pyffmpeg.pseudo_ffprobe.FFprobe')
+        self.logger.info('FFprobe initialised')
         self.misc = Paths()
         self._ffmpeg = self.misc.load_ffmpeg_bin()
+        self.logger.info(f'ffmpeg bin: {self._ffmpeg}')
         self.file_name = file_name
         self.overwrite = True
         if self.overwrite:
@@ -37,7 +45,7 @@ class FFprobe():
         self.start = 0
         self.bitrate = 0
         self.type = ''
-        self.metadata = [[{}, {}], {}]  # mock indeces
+        self.metadata = ModifiedList([ModifiedList([]), {}])  # mock indeces
         self.other_metadata = {}
         self._other_metadata = []
 
@@ -57,6 +65,12 @@ class FFprobe():
 
     def _expose(self):
         # Expose public functions
+        self.logger.info('Inside expose')
+
+        if len(self.metadata[0]) < 1:
+            self.logger.info("No metadata")
+            return
+
         if 'Duration' in self.metadata[-1]:
             self.duration = self.metadata[-1]['Duration']
 
@@ -66,20 +80,22 @@ class FFprobe():
         if 'fps' in self.metadata[0][0]:
             self.fps = self.metadata[0][0]['fps']
 
-        elif 'fps' in self.metadata[0][1]:
+        elif len(self.metadata[0]) > 1 and 'fps' in self.metadata[0][1]:
             self.fps = self.metadata[0][1]['fps']
 
-
     def _extract(self):
+        self.logger.info('Inside extract')
         for stream in self.raw_streams:
             self._extract_all(stream)
 
     def _extract_fps(self, stream):
+        self.logger.info('Inside _extract_fps')
         # Extract fps data from the stream
         fps_str = re.findall(r'\d+.?\d* fps', stream)[0].split(' fps')[0]
         self.fps = float(fps_str)
 
     def _extract_all(self, stdout):
+        self.logger.info('Inside _extract_all')
         # pick only streams, all of them
 
         if 'misdetection possible' in stdout:
@@ -87,25 +103,39 @@ class FFprobe():
             return
 
         all_streams = stdout.split('Stream mapping')[0]
-        all_streams = all_streams.split('Input')[1]
+        all_streams = all_streams.split('Input')
 
+        if len(all_streams) < 2:
+            # Error
+            all_streams = all_streams[0]
+            self.error = re.split(r'libpostproc .*?.*?.*?\n', all_streams)[-1]
+            self.logger.error(self.error)
+            raise Exception(self.error)
+        else:
+            del all_streams[0]
+            if len(all_streams) > 1:
+                print("Multiple input files found.\
+                     However only one will be probed")
+            all_streams = all_streams[0]
         # individual streams
         streams = all_streams.split('Stream')
-        for x in range(len(streams)):
-            if x == 0:
-                if streams[x]:
-                    self.metadata[-1] = self._parse_input_meta(streams[x])
-            else:
-                if streams[x]:
-                    self.metadata[0][x-1] = self._parse_meta(streams[x])
+        self.metadata[-1] = self._parse_input_meta(streams[0])
 
-        # parse other metadata
+        tags = defaultdict(list)
+        for x in range(1, len(streams)):
+            if streams[x]:
+                tags.update(self._parse_meta(streams[x]))
+
+        if len(tags) > 0:
+            self.metadata[0] = tags
+
         self._parse_other_meta()
 
         # then handle stream 0:0 so
         self._parse_stream_meta(self.stream_heads)
 
     def get_album_art(self, out_file=None):
+        self.logger.info('Inside get_album_art')
         user_file = True
         if not out_file:
             # randomize the filename to avoid overwrite prompt
@@ -134,23 +164,13 @@ class FFprobe():
                 return data
 
     def _parse_meta(self, stream):
-        tags = {}
+        self.logger.info('Inside _parse_meta')
         metadata = self._strip_meta(stream)
-        for x in range(len(metadata)):
-            line = metadata[x]
-            data = line.split(":", 1)
-            key = data[0].strip()
-            value = data[1].strip()
-            # this might be a continuation
-            if key == '':
-                tags[prev_key] += "\\r\\n" + data[1].strip()
-            else:
-                tags[key] = value
-                prev_key = key
-
+        tags = self._generate_tags(metadata)
         return tags
 
     def _parse_header(self, line):
+        self.logger.info('Inside _parse_header')
         parsed = []
 
         if 'Video' in line:
@@ -166,24 +186,13 @@ class FFprobe():
         return parsed
 
     def _parse_input_meta(self, stream):
-        tags = {}
+        self.logger.info('Inside _parse_input_meta')
         metadata = self._strip_input_meta(stream)
-
-        for x in range(len(metadata)):
-            line = metadata[x]
-            data = line.split(":", 1)
-            key = data[0].strip()
-            value = data[1].strip()
-            # this might be a continuation
-            if key == '':
-                tags[prev_key] += "\\r\\n" + data[1].strip()
-            else:
-                tags[key] = value
-                prev_key = key
-
+        tags = self._generate_tags(metadata)
         return tags
 
     def _parse_other_meta(self):
+        self.logger.info('Inside _parse_other_meta')
         for stream in self._other_metadata:
             items = stream.split(',')
             for each in items:
@@ -207,6 +216,7 @@ class FFprobe():
             self.bitrate = self.other_metadata['bitrate']
 
     def _parse_stream_meta(self, stream):
+        self.logger.info('Inside _parse_stream_meta')
         for stream in stream:
             infos = stream.split(': ')[-1]
             data = infos.split(', ')
@@ -221,11 +231,17 @@ class FFprobe():
                     self.type = each
 
     def probe(self):
+        self.logger.info('Inside probe')
+        self.logger.info(f'Probing file: "{self.file_name}"')
 
         # randomize the filename to avoid overwrite prompt
-        out_file = str(random.randrange(1, 10000000)) + '.mp3'
 
-        commands = [self._ffmpeg, '-i', self.file_name, out_file]
+        commands = [
+            self._ffmpeg, '-y', '-i',
+            self.file_name, '-f',
+            'null', os.devnull]
+
+        self.logger.info(f"Issuing commads {str(commands)}")
 
         # start subprocess
         subP = subprocess.Popen(
@@ -233,21 +249,20 @@ class FFprobe():
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
             shell=SHELL)
 
         # break the operation
-        sleep(0.02)
-        stdout, _ = subP.communicate(input=b'q')
+        sleep(0.5)
+        stdout, _ = subP.communicate(input='q')
 
-        if os.path.exists(out_file):
-            os.unlink(out_file)
-
-        self._extract_all(str(stdout, 'utf-8'))
+        self._extract_all(stdout)
 
         # Expose publicly know var
         self._expose()
 
     def _strip_meta(self, stdout):
+        self.logger.info('Inside _strip_meta')
         std = stdout.splitlines()
 
         # store in stream header
@@ -263,6 +278,7 @@ class FFprobe():
         return header + meta
 
     def _strip_input_meta(self, stdout):
+        self.logger.info('Inside _strip_input_meta')
         # replace commas with '\r\n'
         stdout = stdout.replace(', ', '\r\n')
         std = stdout.splitlines()
@@ -274,3 +290,23 @@ class FFprobe():
                 meta.append(line)
 
         return meta
+
+    def _generate_tags(self, metadata):
+        prev_key = ''
+        tags = defaultdict(list)
+
+        for x in range(len(metadata)):
+            line = metadata[x]
+            data = line.split(":", 1)
+            key = data[0].strip() 
+            value = data[1].strip()
+            # this might be a continuation, if not we add it to orphaned key list
+            if key == '':
+                if prev_key == '':
+                    tags['unpaired_values'].append(value)
+                else:
+                    tags[prev_key].append("\\r\\n" + data[1].strip())
+            else:
+                tags[key] = value
+                prev_key = key
+        return tags
